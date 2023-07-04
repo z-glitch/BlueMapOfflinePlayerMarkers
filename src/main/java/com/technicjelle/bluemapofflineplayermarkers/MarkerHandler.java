@@ -20,6 +20,7 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.util.*;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 
 public class MarkerHandler {
@@ -64,6 +65,17 @@ public class MarkerHandler {
 		if (blueMapWorld == null) return;
 
 		String playerName = player.getName();
+		if (playerName == null) {
+			// As a last resort, go through white/blacklist + operators list.
+			// TODO: Should use an actual library as a fix instead.
+			Optional<OfflinePlayer> offlinePlayerInServerLists = Stream.of(
+					Bukkit.getWhitelistedPlayers(), Bukkit.getBannedPlayers(), Bukkit.getOperators())
+					.flatMap(Set::stream)
+					.filter(offlinePlayers -> offlinePlayers.getUniqueId().equals(player.getUniqueId())).findFirst();
+			if (offlinePlayerInServerLists.isPresent()) {
+				playerName = offlinePlayerInServerLists.get().getName();
+			}
+		}
 		// Create marker-template
 		// (add 1.8 to y to place the marker at the head-position of the player, like BlueMap does with its player-markers)
 		POIMarker.Builder markerBuilder = POIMarker.builder()
