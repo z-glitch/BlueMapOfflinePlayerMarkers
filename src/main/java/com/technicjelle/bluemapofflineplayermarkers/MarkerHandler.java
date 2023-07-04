@@ -1,8 +1,6 @@
 package com.technicjelle.bluemapofflineplayermarkers;
 
-import com.flowpowered.nbt.CompoundMap;
-import com.flowpowered.nbt.CompoundTag;
-import com.flowpowered.nbt.DoubleTag;
+import com.flowpowered.nbt.*;
 import com.flowpowered.nbt.stream.NBTInputStream;
 import com.technicjelle.BMUtils;
 import de.bluecolored.bluemap.api.BlueMapAPI;
@@ -20,10 +18,9 @@ import org.bukkit.entity.Player;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.util.List;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 
 public class MarkerHandler {
@@ -68,13 +65,22 @@ public class MarkerHandler {
 		if (blueMapWorld == null) return;
 
 		String playerName = player.getName();
-		if (playerName == null)
-			playerName = player.getUniqueId().toString();
+		if (playerName == null) {
+			// As a last resort, go through white/blacklist + operators list.
+			// TODO: Should use an actual library as a fix instead.
+			Optional<OfflinePlayer> offlinePlayerInServerLists = Stream.of(
+					Bukkit.getWhitelistedPlayers(), Bukkit.getBannedPlayers(), Bukkit.getOperators())
+					.flatMap(Set::stream)
+					.filter(offlinePlayers -> offlinePlayers.getUniqueId().equals(player.getUniqueId())).findFirst();
+			if (offlinePlayerInServerLists.isPresent()) {
+				playerName = offlinePlayerInServerLists.get().getName();
+			}
+		}
 		// Create marker-template
 		// (add 1.8 to y to place the marker at the head-position of the player, like BlueMap does with its player-markers)
 		POIMarker.Builder markerBuilder = POIMarker.builder()
-				.label(playerName)
-				.detail(playerName + " <i>(offline)</i><br>"
+				.label(playerName != null ? playerName : player.getUniqueId().toString())
+				.detail((playerName != null ? playerName : "[Unknown]") + " <i>(offline)</i><br>"
 						+ "<bmopm-datetime data-timestamp=" + player.getLastPlayed() + "></bmopm-datetime>")
 				.styleClasses("bmopm-offline-player")
 				.position(location.getX(), location.getY() + 1.8, location.getZ());
@@ -96,7 +102,9 @@ public class MarkerHandler {
 			markerSet.put(player.getUniqueId().toString(), markerBuilder.build());
 		}
 
-		plugin.getLogger().info("Marker for " + playerName + " added");
+		plugin.getLogger().info("Marker for "
+				+ (playerName != null ? playerName : player.getUniqueId().toString())
+				+ " added");
 	}
 
 
@@ -157,29 +165,85 @@ public class MarkerHandler {
 			}
 
 			//Collect data
-			int gameModeInt = (int) nbtData.get("playerGameType").getValue();
 			@SuppressWarnings("unchecked") //Apparently this is just how it should be https://discord.com/channels/665868367416131594/771451216499965953/917450319259115550
-			List<Double> position = ((List<DoubleTag>) nbtData.get("Pos").getValue()).stream().map(DoubleTag::getValue).collect(Collectors.toList());
-			World world;
-			try {
-				long worldUUIDLeast = (long) nbtData.get("WorldUUIDLeast").getValue();
-				long worldUUIDMost = (long) nbtData.get("WorldUUIDMost").getValue();
+			Optional<World> worldOptional;
+
+			Optional<Tag<?>> positionOptional = Optional.ofNullable(nbtData.get("Pos"));
+			Optional<Tag<?>> gameModeIntOptional = Optional.ofNullable(nbtData.get("playerGameType"));
+			Optional<Tag<?>> worldUUIDLeastOptional = Optional.ofNullable(nbtData.get("WorldUUIDLeast"));
+			Optional<Tag<?>> worldUUIDMostOptional = Optional.ofNullable(nbtData.get("WorldUUIDMost"));
+
+			if (positionOptional.isEmpty()) {
+				plugin.getLogger().warning("Player " + op.getName() + " has no (or corrupted) position data!, skipping...");
+				continue;
+			} else if (gameModeIntOptional.isEmpty()
+					|| !Integer.class.isAssignableFrom(gameModeIntOptional.get().getValue().getClass())) {
+				plugin.getLogger().warning("Player " + op.getName() + " has no (or corrupted) gamemode data!, skipping...");
+				continue;
+			} else if (worldUUIDLeastOptional.isEmpty() || worldUUIDMostOptional.isEmpty()) {
+				// Old playerdata present!
+				plugin.getLogger().fine("Can't find WorldUUID for " + op.getUniqueId() + ".  Using Dimension instead if available.");
+				Optional<Tag<?>> dimensionOptional = Optional.ofNullable(nbtData.get("Dimension"));
+				if (dimensionOptional.isEmpty()
+						|| !Integer.class.isAssignableFrom(dimensionOptional.get().getValue().getClass())) {
+					plugin.getLogger().warning("Player " + op.getName() + " has no (or corrupted) dimension data!, skipping...");
+					continue;
+				}
+
+				int dimension = (int) dimensionOptional.get().getValue();
+				worldOptional = Optional.ofNullable(getWorldByDimension(dimension));
+			} else if (!Long.class.isAssignableFrom(worldUUIDLeastOptional.get().getValue().getClass())
+				|| !Long.class.isAssignableFrom(worldUUIDMostOptional.get().getValue().getClass())) {
+				// Should not happen.
+				plugin.getLogger().warning("Player " + op.getName() + " has corrupted dimension data!, skipping...");
+				continue;
+			} else {
+				// 'Normal' flow
+				long worldUUIDLeast = (long) worldUUIDLeastOptional.get().getValue();
+				long worldUUIDMost = (long) worldUUIDMostOptional.get().getValue();
 				UUID worldUUID = new UUID(worldUUIDMost, worldUUIDLeast);
-				world = Bukkit.getWorld(worldUUID);
-			} catch (NullPointerException e) {
-				plugin.getLogger().fine("Can't find WorldUUID for " + op.getUniqueId() + ".  Using Dimension instead.");
-				int dimension = (int) nbtData.get("Dimension").getValue();
-				world = getWorldByDimension(dimension);
+				worldOptional = Optional.ofNullable(Bukkit.getWorld(worldUUID));
+			}
+
+			//World doesn't exist
+			if (worldOptional.isEmpty()) {
+				plugin.getLogger().warning(String.format("World not found for player: %s", op.getName()));
+				continue;
+			}
+			// Build position
+			List<Double> position = new ArrayList<>();
+			if (!Collection.class.isAssignableFrom(positionOptional.get().getValue().getClass())) {
+				plugin.getLogger().warning(String.format("Position for player corrupt!: %s", op.getName()));
+				continue;
+			}
+			boolean corrupt = false;
+			for (Object o : (Collection<?>) positionOptional.get().getValue()) {
+				if (!Tag.class.isAssignableFrom(o.getClass())) {
+					corrupt = true;
+					break;
+				}
+				Tag<?> t = (Tag<?>) o;
+				if (t.getType() != TagType.TAG_DOUBLE) {
+					corrupt = true;
+					break;
+				}
+				DoubleTag dt = (DoubleTag) t;
+				position.add(dt.getValue());
+			}
+			if (corrupt) {
+				plugin.getLogger().warning(String.format("Position for player corrupt!: %s", op.getName()));
+				continue;
+			} else if (position.size() != 3) {
+				plugin.getLogger().warning(String.format("Position for player corrupt!: %s", op.getName()));
+				continue;
 			}
 
 			//Convert to location
-			//World doesn't exist or position is broken
-			if (world == null || position.size() != 3) continue;
-			Location loc = new Location(world, position.get(0), position.get(1), position.get(2));
+			Location loc = new Location(worldOptional.get(), position.get(0), position.get(1), position.get(2));
 
 			//Convert to game mode
 			@SuppressWarnings("deprecation")
-			GameMode gameMode = GameMode.getByValue(gameModeInt);
+			GameMode gameMode = GameMode.getByValue((int) gameModeIntOptional.get().getValue());
 
 			//Add marker
 			add(op, loc, gameMode);
